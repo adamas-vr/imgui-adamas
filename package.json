@@ -1,7 +1,7 @@
 {
   "name": "imgui-adamas",
   "version": "1.0.0",
-  "main": "imgui",
+  "main": "index",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -9,9 +9,12 @@
   "license": "ISC",
   "description": "",
   "devDependencies": {
+    "@types/node": "^25.6.2",
     "typescript": "^6.0.3"
   },
   "dependencies": {
+    "@adamasvr/sdk": "^0.3.4",
+    "gl-matrix": "^3.4.4",
     "ts-node": "^10.9.2"
   }
 }
