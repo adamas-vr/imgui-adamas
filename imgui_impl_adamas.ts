@@ -703,15 +703,7 @@ async function uploadFramebuffer(): Promise<void> {
 	}
 	const width = runtime.options.displayWidth;
 	const height = runtime.options.displayHeight;
-	const rowBytes = width * 4;
-	for (let y = 0; y < height; y++) {
-		const srcRowStart = y * rowBytes;
-		const dstRowStart = (height - 1 - y) * rowBytes;
-		runtime.uploadBuffer.set(
-			runtime.framebuffer.subarray(srcRowStart, srcRowStart + rowBytes),
-			dstRowStart,
-		);
-	}
+	runtime.uploadBuffer.set(runtime.framebuffer);
 	await TextureManager.LoadRGBAImage(
 		runtime.outputTexture,
 		runtime.uploadBuffer,
