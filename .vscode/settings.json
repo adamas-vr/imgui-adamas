@@ -1,0 +1,14 @@
+{
+    "editor.defaultFormatter": "esbenp.prettier-vscode",
+    "prettier.configPath": ".prettierrc",
+    "editor.formatOnSave": true,
+    "editor.insertSpaces": false,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": false,
+    "files.associations": {
+        ".amat": "json",
+        ".atex": "json",
+        ".amesh": "json",
+        ".afab": "json"
+    }
+}

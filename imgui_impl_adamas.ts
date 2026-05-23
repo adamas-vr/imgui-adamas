@@ -23,11 +23,45 @@ import { quat, vec2, vec3 } from "gl-matrix";
 
 type TextureId = number;
 type Hand = "left" | "right";
+type HandPose = {
+	origin: vec3;
+	rotation: quat;
+};
 
 interface CpuTexture {
 	width: number;
 	height: number;
 	rgba: Uint8Array;
+}
+
+interface RuntimeBase {
+	options: Required<AdamasInitOptions>;
+	shutdown: boolean;
+	prevTime: number;
+	framebuffer: Uint8Array;
+	uploadBuffer: Uint8Array;
+	textureRegistry: Map<TextureId, CpuTexture>;
+	nextTextureId: number;
+	input: {
+		leftTrigger: number;
+		rightTrigger: number;
+		leftGrip: number;
+		rightGrip: number;
+		leftPrimaryAxis: vec2;
+		rightPrimaryAxis: vec2;
+	};
+	preferredHand: Hand | null;
+	cursorPosition: { x: number; y: number } | null;
+	subscriptions: DeviceSubscription[];
+}
+
+interface RuntimeState extends RuntimeBase {
+	outputTexture: Texture;
+	fontTextureId: TextureId;
+	leftHandEntity: Entity;
+	rightHandEntity: Entity;
+	targetEntity: Entity;
+	targetMaterial: Material;
 }
 
 export interface AdamasInitOptions {
@@ -49,7 +83,7 @@ const DEFAULT_OPTIONS: Required<
 	cursorColor: [20, 71, 230, 200],
 };
 
-function createRuntime(options: AdamasInitOptions) {
+function createRuntimeBase(options: AdamasInitOptions): RuntimeBase {
 	const runtimeOptions = {
 		...DEFAULT_OPTIONS,
 		...options,
@@ -58,20 +92,12 @@ function createRuntime(options: AdamasInitOptions) {
 		runtimeOptions.displayWidth * runtimeOptions.displayHeight * 4;
 	return {
 		options: runtimeOptions,
-		initialized: false,
-		initializing: false,
 		shutdown: false,
 		prevTime: 0,
 		framebuffer: new Uint8Array(framebufferSize),
 		uploadBuffer: new Uint8Array(framebufferSize),
-		outputTexture: null as Texture | null,
-		fontTextureId: null as TextureId | null,
 		textureRegistry: new Map<TextureId, CpuTexture>(),
 		nextTextureId: 1,
-		leftHandEntity: null as Entity | null,
-		rightHandEntity: null as Entity | null,
-		targetEntity: null as Entity | null,
-		targetMaterial: null as Material | null,
 		input: {
 			leftTrigger: 0,
 			rightTrigger: 0,
@@ -83,23 +109,20 @@ function createRuntime(options: AdamasInitOptions) {
 		preferredHand: null as Hand | null,
 		cursorPosition: null as { x: number; y: number } | null,
 		subscriptions: [] as DeviceSubscription[],
-		renderQueue: Promise.resolve(),
 	};
 }
 
-let runtime = createRuntime({
-	targetEntity: -1 as Entity,
-	displayWidth: 1,
-	displayHeight: 1,
-});
+let runtime!: RuntimeState;
+let runtimeReady = false;
+let initPromise: Promise<void> | null = null;
 
 export let gl: null = null;
 export let ctx: null = null;
 
 let clipboardText = "";
 
-function nextTextureId(): TextureId {
-	const id = runtime.nextTextureId++;
+function nextTextureId(state: RuntimeBase): TextureId {
+	const id = state.nextTextureId++;
 	return id;
 }
 
@@ -352,6 +375,7 @@ function currentButtonValue(hand: Hand, kind: "trigger" | "grip"): number {
 }
 
 async function subscribeDeviceValue<T extends number | vec2>(
+	state: RuntimeBase,
 	devicePath: string,
 	setter: (value: T) => void,
 ): Promise<void> {
@@ -359,94 +383,64 @@ async function subscribeDeviceValue<T extends number | vec2>(
 	const subscription = await Device.SubscribeValueChange(devicePath, (value) =>
 		setter(value as T),
 	);
-	runtime.subscriptions.push(subscription);
+	state.subscriptions.push(subscription);
 }
 
-async function ensurePanelEntity(): Promise<void> {
-	if (runtime.targetEntity !== null) {
-		return;
-	}
-
-	runtime.targetEntity = runtime.options.targetEntity;
-
-	if (!(await RenderableManager.HasComponent(runtime.targetEntity))) {
-		await RenderableManager.Create(runtime.targetEntity);
-		await RenderableManager.SetReceiveShadows(runtime.targetEntity, false);
-		await RenderableManager.SetShadowMode(
-			runtime.targetEntity,
-			ShadowCastingMode.Off,
-		);
+async function initializePanelEntity(targetEntity: Entity): Promise<Material> {
+	if (!(await RenderableManager.HasComponent(targetEntity))) {
+		await RenderableManager.Create(targetEntity);
+		await RenderableManager.SetReceiveShadows(targetEntity, false);
+		await RenderableManager.SetShadowMode(targetEntity, ShadowCastingMode.Off);
 	}
 
 	try {
-		await RenderableManager.GetMesh(runtime.targetEntity);
+		await RenderableManager.GetMesh(targetEntity);
 	} catch {
-		await RenderableManager.SetMesh(runtime.targetEntity, await NewQuadMesh());
+		await RenderableManager.SetMesh(targetEntity, await NewQuadMesh());
 	}
 
 	try {
-		runtime.targetMaterial = await RenderableManager.GetMaterial(
-			runtime.targetEntity,
-		);
+		return await RenderableManager.GetMaterial(targetEntity);
 	} catch {
-		runtime.targetMaterial = await MaterialManager.Create();
+		const targetMaterial = await MaterialManager.Create();
 
-		await RenderableManager.SetMaterial(
-			runtime.targetEntity,
-			runtime.targetMaterial,
-		);
+		await RenderableManager.SetMaterial(targetEntity, targetMaterial);
 
-		await MaterialManager.SetAlphaMode(runtime.targetMaterial, AlphaMode.Blend);
-		await MaterialManager.SetFloat(
-			runtime.targetMaterial,
-			MaterialProperty.Culling,
-			0,
-		);
+		await MaterialManager.SetAlphaMode(targetMaterial, AlphaMode.Blend);
+		await MaterialManager.SetFloat(targetMaterial, MaterialProperty.Culling, 0);
+		return targetMaterial;
 	}
 }
 
-async function ensureOutputTexture(): Promise<void> {
-	if (runtime.outputTexture !== null) {
-		return;
-	}
-	runtime.outputTexture = await TextureManager.Create2D(
-		runtime.options.displayWidth,
-		runtime.options.displayHeight,
+async function createOutputTexture(
+	state: RuntimeBase,
+	targetMaterial: Material,
+): Promise<Texture> {
+	const outputTexture = await TextureManager.Create2D(
+		state.options.displayWidth,
+		state.options.displayHeight,
 		TextureFormat.RGBA32,
 		true,
 	);
-	await TextureManager.SetFilterMode(
-		runtime.outputTexture,
-		TextureFilterMode.Linear,
+	await TextureManager.SetFilterMode(outputTexture, TextureFilterMode.Linear);
+	await TextureManager.SetWrapModeU(outputTexture, TextureWrapMode.ClampToEdge);
+	await TextureManager.SetWrapModeV(outputTexture, TextureWrapMode.ClampToEdge);
+	await MaterialManager.SetTexture(
+		targetMaterial,
+		MaterialProperty.BaseColorMap,
+		outputTexture,
 	);
-	await TextureManager.SetWrapModeU(
-		runtime.outputTexture,
-		TextureWrapMode.ClampToEdge,
+	await MaterialManager.SetTexture(
+		targetMaterial,
+		MaterialProperty.EmissionMap,
+		outputTexture,
 	);
-	await TextureManager.SetWrapModeV(
-		runtime.outputTexture,
-		TextureWrapMode.ClampToEdge,
-	);
-	if (runtime.targetMaterial !== null) {
-		await MaterialManager.SetTexture(
-			runtime.targetMaterial,
-			MaterialProperty.BaseColorMap,
-			runtime.outputTexture,
-		);
-		await MaterialManager.SetTexture(
-			runtime.targetMaterial,
-			MaterialProperty.EmissionMap,
-			runtime.outputTexture,
-		);
-	}
+	return outputTexture;
 }
 
-async function ensureFontTexture(): Promise<void> {
-	if (runtime.fontTextureId !== null) {
-		return;
-	}
+function createFontTexture(state: RuntimeBase): TextureId {
 	const { width, height, pixels } = ImGui.GetIO().Fonts.GetTexDataAsRGBA32();
-	const id = nextTextureId();
+	const id = nextTextureId(state);
 	const rgba = new Uint8Array(
 		pixels.buffer,
 		pixels.byteOffset,
@@ -457,26 +451,74 @@ async function ensureFontTexture(): Promise<void> {
 		height,
 		rgba: new Uint8Array(rgba),
 	};
-	runtime.fontTextureId = id;
-	runtime.textureRegistry.set(id, cpuTexture);
+	state.textureRegistry.set(id, cpuTexture);
 	ImGui.GetIO().Fonts.TexID = id;
+	return id;
 }
 
-async function intersectHand(
-	hand: Hand,
+async function createRuntime(
+	options: AdamasInitOptions,
+): Promise<RuntimeState> {
+	const state = createRuntimeBase(options);
+	const localUser = await User.GetLocalUser();
+	const [leftHandEntity, rightHandEntity, targetMaterial] = await Promise.all([
+		localUser.GetLeftHandEntity(),
+		localUser.GetRightHandEntity(),
+		initializePanelEntity(options.targetEntity),
+	]);
+
+	await Promise.all([
+		subscribeDeviceValue<number>(state, DevicePath.LEFT_TRIGGER, (value) => {
+			state.input.leftTrigger = value;
+		}),
+		subscribeDeviceValue<number>(state, DevicePath.RIGHT_TRIGGER, (value) => {
+			state.input.rightTrigger = value;
+		}),
+		subscribeDeviceValue<number>(state, DevicePath.LEFT_GRIP, (value) => {
+			state.input.leftGrip = value;
+		}),
+		subscribeDeviceValue<number>(state, DevicePath.RIGHT_GRIP, (value) => {
+			state.input.rightGrip = value;
+		}),
+		subscribeDeviceValue<vec2>(
+			state,
+			DevicePath.LEFT_PRIMARY_2D_AXIS,
+			(value) => vec2.copy(state.input.leftPrimaryAxis, value),
+		),
+		subscribeDeviceValue<vec2>(
+			state,
+			DevicePath.RIGHT_PRIMARY_2D_AXIS,
+			(value) => vec2.copy(state.input.rightPrimaryAxis, value),
+		),
+	]);
+
+	const [outputTexture, fontTextureId] = await Promise.all([
+		createOutputTexture(state, targetMaterial),
+		Promise.resolve(createFontTexture(state)),
+	]);
+
+	return {
+		...state,
+		outputTexture,
+		fontTextureId,
+		leftHandEntity,
+		rightHandEntity,
+		targetEntity: options.targetEntity,
+		targetMaterial,
+	};
+}
+
+function intersectHand(
+	handPose: HandPose | null,
 	panelPosition: vec3,
 	panelRotation: quat,
 	panelScale: vec3,
-): Promise<{ x: number; y: number } | null> {
-	const handEntity =
-		hand === "left" ? runtime.leftHandEntity : runtime.rightHandEntity;
-
-	if (handEntity === null) {
+): { x: number; y: number } | null {
+	if (handPose === null) {
 		return null;
 	}
 
-	const origin = await TransformManager.GetWorldPosition(handEntity);
-	const rotation = await TransformManager.GetWorldRotation(handEntity);
+	const { origin, rotation } = handPose;
 	const direction = vec3.normalize(
 		vec3.create(),
 		vec3.transformQuat(vec3.create(), vec3.fromValues(0, 0, -1), rotation),
@@ -518,23 +560,32 @@ async function intersectHand(
 
 async function updateMouseFromHands(): Promise<void> {
 	const io = ImGui.GetIO();
-	if (runtime.targetEntity === null) {
-		io.MousePos.x = -Number.MAX_VALUE;
-		io.MousePos.y = -Number.MAX_VALUE;
-		return;
-	}
-
-	const panelPosition = await TransformManager.GetWorldPosition(
-		runtime.targetEntity,
-	);
-	const panelRotation = await TransformManager.GetWorldRotation(
-		runtime.targetEntity,
-	);
-	const panelScale = await TransformManager.GetLocalScale(runtime.targetEntity);
+	const targetEntity = runtime.targetEntity;
+	const leftHandEntity = runtime.leftHandEntity;
+	const rightHandEntity = runtime.rightHandEntity;
+	const [
+		panelPosition,
+		panelRotation,
+		panelScale,
+		leftHandPose,
+		rightHandPose,
+	] = await Promise.all([
+		TransformManager.GetWorldPosition(targetEntity),
+		TransformManager.GetWorldRotation(targetEntity),
+		TransformManager.GetLocalScale(targetEntity),
+		Promise.all([
+			TransformManager.GetWorldPosition(leftHandEntity),
+			TransformManager.GetWorldRotation(leftHandEntity),
+		]).then(([origin, rotation]) => ({ origin, rotation })),
+		Promise.all([
+			TransformManager.GetWorldPosition(rightHandEntity),
+			TransformManager.GetWorldRotation(rightHandEntity),
+		]).then(([origin, rotation]) => ({ origin, rotation })),
+	]);
 	const intersections = {
-		left: await intersectHand("left", panelPosition, panelRotation, panelScale),
-		right: await intersectHand(
-			"right",
+		left: intersectHand(leftHandPose, panelPosition, panelRotation, panelScale),
+		right: intersectHand(
+			rightHandPose,
 			panelPosition,
 			panelRotation,
 			panelScale,
@@ -571,49 +622,6 @@ async function updateMouseFromHands(): Promise<void> {
 			? scrollAxis[1] * runtime.options.scrollSpeed
 			: 0;
 	io.MouseWheelH = 0;
-}
-
-async function ensureInitialized(): Promise<void> {
-	if (runtime.initialized || runtime.initializing || runtime.shutdown) {
-		return;
-	}
-	runtime.initializing = true;
-	try {
-		const localUser = await User.GetLocalUser();
-		runtime.leftHandEntity = await localUser.GetLeftHandEntity();
-		runtime.rightHandEntity = await localUser.GetRightHandEntity();
-
-		await subscribeDeviceValue<number>(
-			DevicePath.LEFT_TRIGGER,
-			(value) => (runtime.input.leftTrigger = value),
-		);
-		await subscribeDeviceValue<number>(
-			DevicePath.RIGHT_TRIGGER,
-			(value) => (runtime.input.rightTrigger = value),
-		);
-		await subscribeDeviceValue<number>(
-			DevicePath.LEFT_GRIP,
-			(value) => (runtime.input.leftGrip = value),
-		);
-		await subscribeDeviceValue<number>(
-			DevicePath.RIGHT_GRIP,
-			(value) => (runtime.input.rightGrip = value),
-		);
-		await subscribeDeviceValue<vec2>(DevicePath.LEFT_PRIMARY_2D_AXIS, (value) =>
-			vec2.copy(runtime.input.leftPrimaryAxis, value),
-		);
-		await subscribeDeviceValue<vec2>(
-			DevicePath.RIGHT_PRIMARY_2D_AXIS,
-			(value) => vec2.copy(runtime.input.rightPrimaryAxis, value),
-		);
-
-		await ensurePanelEntity();
-		await ensureOutputTexture();
-		await ensureFontTexture();
-		runtime.initialized = true;
-	} finally {
-		runtime.initializing = false;
-	}
 }
 
 function renderCpu(drawData: ImGui.DrawData): void {
@@ -698,9 +706,6 @@ function renderCpu(drawData: ImGui.DrawData): void {
 }
 
 async function uploadFramebuffer(): Promise<void> {
-	if (runtime.outputTexture === null) {
-		return;
-	}
 	const width = runtime.options.displayWidth;
 	const height = runtime.options.displayHeight;
 	runtime.uploadBuffer.set(runtime.framebuffer);
@@ -712,76 +717,76 @@ async function uploadFramebuffer(): Promise<void> {
 	);
 }
 
-export function Init(options: AdamasInitOptions | null): void {
+export async function Init(options: AdamasInitOptions | null): Promise<void> {
 	if (options === null) {
 		throw new Error("imgui_impl_adamas_node.Init requires a targetEntity");
 	}
-	if ((runtime.initialized || runtime.initializing) && !runtime.shutdown) {
+	if (runtimeReady && !runtime.shutdown) {
 		return;
 	}
-	runtime = createRuntime(options);
+	if (initPromise !== null) {
+		await initPromise;
+		return;
+	}
 
-	const io = ImGui.GetIO();
-	io.BackendPlatformName = "imgui_impl_adamas";
-	io.BackendRendererName = "imgui_impl_adamas_node_rgba";
-	io.DisplaySize.x = runtime.options.displayWidth;
-	io.DisplaySize.y = runtime.options.displayHeight;
-	io.DisplayFramebufferScale.x = 1;
-	io.DisplayFramebufferScale.y = 1;
-	io.SetClipboardTextFn = (_userData: unknown, text: string): void => {
-		clipboardText = text;
-		//FIXME: todo clipboard integration is in-memory only because the Adamas SDK typings do not expose a platform clipboard API.
-	};
-	io.GetClipboardTextFn = (): string => clipboardText;
-	io.ClipboardUserData = null;
-	//FIXME: todo keyboard input is not wired because the current public Adamas device API only exposes controller-style inputs.
+	initPromise = (async () => {
+		const nextRuntime = await createRuntime(options);
+		const io = ImGui.GetIO();
+		io.BackendPlatformName = "imgui_impl_adamas";
+		io.BackendRendererName = "imgui_impl_adamas_node_rgba";
+		io.DisplaySize.x = nextRuntime.options.displayWidth;
+		io.DisplaySize.y = nextRuntime.options.displayHeight;
+		io.DisplayFramebufferScale.x = 1;
+		io.DisplayFramebufferScale.y = 1;
+		io.SetClipboardTextFn = (_userData: unknown, text: string): void => {
+			clipboardText = text;
+			//FIXME: todo clipboard integration is in-memory only because the Adamas SDK typings do not expose a platform clipboard API.
+		};
+		io.GetClipboardTextFn = (): string => clipboardText;
+		io.ClipboardUserData = null;
+		//FIXME: todo keyboard input is not wired because the current public Adamas device API only exposes controller-style inputs.
 
-	void ensureInitialized().catch((error) => {
+		runtime = nextRuntime;
+		runtimeReady = true;
+	})().catch((error) => {
 		console.error("imgui_impl_adamas init failed", error);
+		throw error;
 	});
+
+	try {
+		await initPromise;
+	} finally {
+		initPromise = null;
+	}
 }
 
 export function Shutdown(): void {
-	runtime.shutdown = true;
-	const subscriptions = [...runtime.subscriptions];
-	runtime.subscriptions = [];
+	if (!runtimeReady) {
+		return;
+	}
+	const state = runtime;
+	runtimeReady = false;
+	state.shutdown = true;
+	const subscriptions = [...state.subscriptions];
+	state.subscriptions = [];
 	void Promise.all(
 		subscriptions.map((subscription) =>
 			Device.UnsubscribeValueChange(subscription).catch(() => false),
 		),
 	)
 		.then(async () => {
-			if (runtime.outputTexture !== null) {
-				await TextureManager.Destroy(runtime.outputTexture).catch(() => false);
-			}
-			if (runtime.targetMaterial !== null) {
-				await MaterialManager.Destroy(runtime.targetMaterial).catch(
-					() => false,
-				);
-			}
-			runtime.initialized = false;
-			runtime.outputTexture = null;
-			runtime.targetMaterial = null;
-			runtime.targetEntity = null;
-			runtime.leftHandEntity = null;
-			runtime.rightHandEntity = null;
-			runtime.textureRegistry.clear();
-			runtime.fontTextureId = null;
+			await TextureManager.Destroy(state.outputTexture).catch(() => false);
+			await MaterialManager.Destroy(state.targetMaterial).catch(() => false);
+			state.textureRegistry.clear();
 		})
 		.catch((error) => {
 			console.error("imgui_impl_adamas shutdown failed", error);
 		});
 }
 
-export function NewFrame(time: number): void {
+export async function NewFrame(time: number): Promise<void> {
 	const io = ImGui.GetIO();
-	io.DisplaySize.x = runtime.options.displayWidth;
-	io.DisplaySize.y = runtime.options.displayHeight;
-	io.DisplayFramebufferScale.x = 1;
-	io.DisplayFramebufferScale.y = 1;
-	io.DeltaTime = computeDeltaTime(time);
-
-	if (!runtime.initialized) {
+	if (!runtimeReady) {
 		io.MousePos.x = -Number.MAX_VALUE;
 		io.MousePos.y = -Number.MAX_VALUE;
 		io.MouseDown[0] = false;
@@ -792,15 +797,19 @@ export function NewFrame(time: number): void {
 		return;
 	}
 
-	void runtime.renderQueue.then(async () => {
-		if (!runtime.shutdown) {
-			await updateMouseFromHands();
-		}
-	});
+	io.DisplaySize.x = runtime.options.displayWidth;
+	io.DisplaySize.y = runtime.options.displayHeight;
+	io.DisplayFramebufferScale.x = 1;
+	io.DisplayFramebufferScale.y = 1;
+	io.DeltaTime = computeDeltaTime(time);
+
+	if (!runtime.shutdown) {
+		await updateMouseFromHands();
+	}
 }
 
-export function RenderDrawData(): void {
-	if (runtime.shutdown) {
+export async function RenderDrawData(): Promise<void> {
+	if (!runtimeReady || runtime.shutdown) {
 		return;
 	}
 	drawCursorDot();
@@ -810,12 +819,5 @@ export function RenderDrawData(): void {
 		return;
 	}
 	renderCpu(drawData);
-	runtime.renderQueue = runtime.renderQueue
-		.then(async () => {
-			await ensureInitialized();
-			await uploadFramebuffer();
-		})
-		.catch((error) => {
-			console.error("imgui_impl_adamas RenderDrawData failed", error);
-		});
+	await uploadFramebuffer();
 }

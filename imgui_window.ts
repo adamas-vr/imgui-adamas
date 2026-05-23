@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import * as ImGui from "./imgui";
 import * as ImGui_Impl from "./imgui_impl_adamas";
 import { robotoTTF } from "./roboto";
+import { Project } from "@adamasvr/sdk";
 
 const DEFAULT_FONT_SIZE_PX = 32;
 
@@ -27,7 +28,24 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 	return buffer;
 }
 
+/**
+ * Creates a Dear ImGui based UI panel for the specified entity.
+ *
+ * The target entity must be provided through the initialization options. The UI
+ * resolution must also be specified with a width and height. The caller is
+ * responsible for setting the entity scale so that its aspect ratio matches the
+ * UI resolution.
+ *
+ * The render target entity needs a quad mesh, material, and texture to
+ * display the UI. These components are optional for the caller to provide; if
+ * they are missing, this helper creates and attaches them automatically.
+ *
+ * @param project - The Adamas project instance.
+ * @param initOptions - Options used to initialize the ImGui window.
+ * @param ui - Callback invoked to render the ImGui UI each update.
+ */
 export async function CreateImGuiWindow(
+	project: Project,
 	initOptions: ImGuiWindowInitOptions,
 	ui: (imgui: typeof ImGui, timestep: number) => void,
 ) {
@@ -64,15 +82,15 @@ export async function CreateImGuiWindow(
 			break;
 	}
 
-	ImGui_Impl.Init(runtimeOptions);
+	await ImGui_Impl.Init(runtimeOptions);
 
 	let lastFrameTime = Date.now();
-	return setInterval(() => {
+	project.ScheduleUpdate(async () => {
 		const now = Date.now();
 		const timestep = now - lastFrameTime;
 		lastFrameTime = now;
 
-		ImGui_Impl.NewFrame(timestep);
+		await ImGui_Impl.NewFrame(timestep);
 		ImGui.NewFrame();
 
 		ImGui.SetNextWindowPos(
@@ -101,6 +119,6 @@ export async function CreateImGuiWindow(
 		ui(ImGui, timestep);
 		ImGui.End();
 
-		ImGui_Impl.RenderDrawData();
-	}, 1000 / 30);
+		await ImGui_Impl.RenderDrawData();
+	});
 }
