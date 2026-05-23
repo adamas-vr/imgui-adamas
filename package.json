@@ -1,13 +1,19 @@
 {
-	"name": "imgui-adamas",
-	"version": "1.0.0",
-	"main": "index",
-	"scripts": {
-		"test": "echo \"Error: no test specified\" && exit 1"
-	},
+	"name": "@adamasvr/imgui",
+	"version": "1.0.1",
 	"author": "Adamas VR, Inc.",
 	"license": "BSD-2-Clause",
+	"private": false,
 	"description": "Dear ImGui with a custom backend for Adamas VR projects",
+	"main": "index",
+	"repository": {
+		"type": "git",
+		"url": "git+ssh://git@github.com:adamas-vr/imgui-adamas.git"
+	},
+	"bugs": {
+		"url": "https://github.com/adamas-vr/imgui-adamas/issues"
+	},
+	"homepage": "https://github.com/adamas-vr/imgui-adamas#readme",
 	"devDependencies": {
 		"@types/node": "^25.6.2",
 		"typescript": "^6.0.3"
