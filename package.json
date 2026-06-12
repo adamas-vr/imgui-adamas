@@ -1,6 +1,6 @@
 {
 	"name": "@adamasvr/imgui",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"author": "Adamas VR, Inc.",
 	"license": "BSD-2-Clause",
 	"private": false,
@@ -25,7 +25,7 @@
 		"typescript": "^6.0.3"
 	},
 	"dependencies": {
-		"@adamasvr/sdk": "^0.4.3",
+		"@adamasvr/sdk": "^0.4.4",
 		"gl-matrix": "^3.4.4",
 		"ts-node": "^10.9.2"
 	}

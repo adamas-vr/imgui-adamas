@@ -9,11 +9,10 @@ import {
 	MaterialManager,
 	MaterialProperty,
 	NewQuadMesh,
-	type Texture,
 	TextureFilterMode,
-	TextureFormat,
 	TextureManager,
 	TextureWrapMode,
+	SharedTexture,
 	TransformManager,
 	User,
 	RenderableManager,
@@ -56,7 +55,7 @@ interface RuntimeBase {
 }
 
 interface RuntimeState extends RuntimeBase {
-	outputTexture: Texture;
+	outputTexture: SharedTexture;
 	fontTextureId: TextureId;
 	leftHandEntity: Entity;
 	rightHandEntity: Entity;
@@ -415,25 +414,33 @@ async function initializePanelEntity(targetEntity: Entity): Promise<Material> {
 async function createOutputTexture(
 	state: RuntimeBase,
 	targetMaterial: Material,
-): Promise<Texture> {
-	const outputTexture = await TextureManager.Create2D(
+): Promise<SharedTexture> {
+	const outputTexture = await SharedTexture.Create(
 		state.options.displayWidth,
 		state.options.displayHeight,
-		TextureFormat.RGBA32,
 		true,
 	);
-	await TextureManager.SetFilterMode(outputTexture, TextureFilterMode.Linear);
-	await TextureManager.SetWrapModeU(outputTexture, TextureWrapMode.ClampToEdge);
-	await TextureManager.SetWrapModeV(outputTexture, TextureWrapMode.ClampToEdge);
+	await TextureManager.SetFilterMode(
+		outputTexture.textureHandle,
+		TextureFilterMode.Linear,
+	);
+	await TextureManager.SetWrapModeU(
+		outputTexture.textureHandle,
+		TextureWrapMode.ClampToEdge,
+	);
+	await TextureManager.SetWrapModeV(
+		outputTexture.textureHandle,
+		TextureWrapMode.ClampToEdge,
+	);
 	await MaterialManager.SetTexture(
 		targetMaterial,
 		MaterialProperty.BaseColorMap,
-		outputTexture,
+		outputTexture.textureHandle,
 	);
 	await MaterialManager.SetTexture(
 		targetMaterial,
 		MaterialProperty.EmissionMap,
-		outputTexture,
+		outputTexture.textureHandle,
 	);
 	return outputTexture;
 }
@@ -708,13 +715,16 @@ function renderCpu(drawData: ImGui.DrawData): void {
 async function uploadFramebuffer(): Promise<void> {
 	const width = runtime.options.displayWidth;
 	const height = runtime.options.displayHeight;
-	runtime.uploadBuffer.set(runtime.framebuffer);
-	await TextureManager.LoadRGBAImage(
-		runtime.outputTexture,
-		runtime.uploadBuffer,
-		width,
-		height,
-	);
+	const rowSize = width * 4;
+	for (let y = 0; y < height; y++) {
+		const sourceOffset = y * rowSize;
+		const targetOffset = (height - 1 - y) * rowSize;
+		runtime.uploadBuffer.set(
+			runtime.framebuffer.subarray(sourceOffset, sourceOffset + rowSize),
+			targetOffset,
+		);
+	}
+	await runtime.outputTexture.uploadRGBA(runtime.uploadBuffer);
 }
 
 export async function Init(options: AdamasInitOptions | null): Promise<void> {
@@ -775,7 +785,7 @@ export function Shutdown(): void {
 		),
 	)
 		.then(async () => {
-			await TextureManager.Destroy(state.outputTexture).catch(() => false);
+			await state.outputTexture.close().catch(() => false);
 			await MaterialManager.Destroy(state.targetMaterial).catch(() => false);
 			state.textureRegistry.clear();
 		})
